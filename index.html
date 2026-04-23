@@ -196,10 +196,10 @@
 //# sourceMappingURL=showdown.min.js.map</script>
   <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs/loader.js"></script>
   <script>
-const mat4 = glMatrix.mat4;
-var zip, root={id:'root',name:'',path:'',isDir:true,children:[]};
-var nodeByPath=new Map();
-var nodeByID=new Map();
+const { mat4 } = glMatrix;
+var zip, root = {id:'root',name:'',path:'',isDir:true,children:[]};
+var nodeByPath = new Map();
+var nodeByID = new Map();
 var selectedNode=null;
 var commandHistory=[], historyIndex=-1;
 
@@ -381,6 +381,11 @@ async function buildFileMap(zipFile) {
   
     // Text files → rewrite references
     let content = await entry.async("string");
+    
+    if (ext == "js") {
+      content = content.replace(/\bimport\s*\(/g, 'requireModule(');
+    }
+    
     const baseDir = path.includes("/") ? path.slice(0, path.lastIndexOf("/") + 1) : "";
     const regex = ext === "css" ? (/url\((["']?)([^)]*)\1\)/g) : (/(["'`])([^"'`]*)\1/g);
     let result = "";
@@ -1252,12 +1257,9 @@ ${document.getElementById("jszip-script").outerHTML}
     },
     async loadConfig() {
       if (!zip) return;
-      alert(2);
       if (!zip.files["preview-config.json"]) return;
-      alert(3);
       const entry = zip.file("preview-config.json");
       if (!entry) alert("Config not found");
-      alert(4);
       const text = await entry.async("string");
       this.updateSettings(JSON.parse(text));
     }
@@ -1267,16 +1269,14 @@ ${document.getElementById("jszip-script").outerHTML}
   ${inferMime.toString()}
   ${buildFileMap.toString()}
   ${parseContent.toString()}
+  ${transpileModule.toString()}
   var resetFileMap = true;
   ${runPreview.toString()}
   
   (async function(){
-    alert(0);
     zip = await JSZip.loadAsync(base64ZipString, { base64: true });
     zip.fileMap = {};
-    alert(1);
     await settingsController.loadConfig();
-    alert(5);
     await runPreview();
   })();
   
@@ -1317,10 +1317,10 @@ ${document.getElementById("jszip-script").outerHTML}
     console.log(msg);
   }
   function logError(msg) {
-    comsole.error(msg);
+    console.error(msg);
   }
   function logWarning(msg) {
-    comsole.warn(msg);
+    console.warn(msg);
   }
 </\x73cript>
 </body>
@@ -1485,9 +1485,36 @@ console.error = function() {
   //window.parent.postMessage({type:"logger",content:'ERROR LOG: ' + Array.from(arguments).map(__log__).join(' ')}, '*');
   window.parent.logError('ERROR LOG: ' + Array.from(arguments).map(__log__).join(' '));
 };
-window.onerror = function(message, source, lineno, colno, error) {
-  window.parent.logError('ERROR: ' + message + ' at ' + source + ':' + lineno);
-  //window.parent.postMessage({type:"logger",content:'ERROR: ' + message + ' at ' + source + ':' + lineno}, '*');
+window.__logErrorObj = function(error) {
+  var { message, fileName, lineNumber, columnNumber } = error;
+  window.parent.logError('ERROR: ' + message + ' at ' + fileName + ':' + lineNumber);
+  //window.parent.postMessage({type:"logger",content:'ERROR: ' + message + ' at ' + source + ':' + lineNumber}, '*');
+};
+window.addEventListener('error',window.__logErrorObj);
+
+window._registry = {};
+window._modules = {};
+window.requireModule = async function(name) {
+  if (_modules[name]) return _modules[name];
+  if (!_registry[name]) {
+    var text;
+    try {
+      const res = await fetch(name,{});
+      text = await res.text();
+    } catch(e) {
+      try {
+        const res = await fetch("https://esm.sh/"+name.replace(/^\\//, ''),{});
+        text = await res.text();
+      } catch(e) {
+        throw new Error("ESM module failed to load: "+name);
+        return null;
+      }
+    }
+    const moduleCode = window.parent.transpileModule(name,text).code;
+    eval(moduleCode);
+  }
+  _modules[name] = await _registry[name]();
+  return _modules[name];
 };
   `;
   doc.head.prepend(logScript);
@@ -1515,15 +1542,162 @@ console.error("Failed to decode base64:", e);
 });
   `;
   doc.body.append(editScript);
-
+  
+  const moduleScripts = doc.querySelectorAll('script[type="module"]');
+  moduleScripts.forEach(script => {
+    const src = script.getAttribute('src');
+    if (!src) return;
+    var dataURL = zipData.fileMap[src];
+    const base64Data = dataURL.split(",")[1];
+    const originalCode = decodeURIComponent(escape(atob(base64Data)));
+    const transpiledCode = transpileModule(src,originalCode).code+`\nwindow._modules["${src}"] = window._registry["${src}"]();`;
+    const newBase64 = btoa(unescape(encodeURIComponent(transpiledCode)));
+    script.setAttribute('src',`data:text/javascript;base64,${newBase64}`);
+    script.removeAttribute('type');
+  });
+  
   // Store original modified HTML for re-running
   var html = doc.documentElement.outerHTML;
-
   for (var i in zipData.fileMap) {
     html = html.replace(new RegExp("(\"|\'|\`)"+i+"(\"|\'|\`)","g"),"$1"+zipData.fileMap[i]+"$2");
   }
-
   return html;
+}
+
+function transpileModule(name, content) {
+  const dependencies = [];
+  const inlineExports = [];
+
+  function resolvePath(ref) {
+    if (!ref.startsWith('.') && !ref.startsWith('/')) return ref;
+    try {
+      const baseName = name.startsWith('/') ? name : '/' + name;
+      const baseUrl = new URL(baseName, 'http://dummy.com');
+      const resolved = new URL(ref, baseUrl);
+      let finalPath = resolved.pathname;
+      if (!name.startsWith('/') && finalPath.startsWith('/')) {
+        finalPath = finalPath.slice(1);
+      }
+      return finalPath;
+    } catch (e) {
+      return ref; 
+    }
+  }
+
+  // 1. Dynamic Imports
+  let code = content.replace(/\bimport\s*\(\s*(["'`])([^"'`]+)\1\s*\)/g, (match, quote, path) => {
+    const resolved = resolvePath(path);
+    return `await requireModuleAsync("${resolved}")`;
+  });
+
+  // 2. Named Imports
+  code = code.replace(/import\s*\{([^}]+)\}\s*from\s*(["'`])([^"'`]+)\2;?/g, (match, imports, quote, path) => {
+    const resolved = resolvePath(path);
+    dependencies.push(resolved);
+    const destructured = imports.split(',').map(item => {
+      let parts = item.trim().split(/\s+as\s+/);
+      return parts.length === 2 ? `${parts[0]}: ${parts[1]}` : parts[0];
+    }).join(', ');
+    return `const { ${destructured} } = await requireModule("${resolved}");`;
+  });
+
+  // 3. Default Imports
+  code = code.replace(/import\s+(?!\{|\*)([a-zA-Z_$][a-zA-Z0-9_$]*)\s+from\s*(["'`])([^"'`]+)\2;?/g, (match, varName, quote, path) => {
+    const resolved = resolvePath(path);
+    dependencies.push(resolved);
+    return `const ${varName} = (await requireModule("${resolved}")).default;`;
+  });
+
+  // 4. Namespace Imports
+  code = code.replace(/import\s*\*\s*as\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s+from\s*(["'`])([^"'`]+)\2;?/g, (match, varName, quote, path) => {
+    const resolved = resolvePath(path);
+    dependencies.push(resolved);
+    return `const ${varName} = await requireModule("${resolved}");`;
+  });
+
+  // 5. Bare Imports
+  code = code.replace(/import\s*(["'`])([^"'`]+)\1;?/g, (match, quote, path) => {
+    const resolved = resolvePath(path);
+    dependencies.push(resolved);
+    return `await requireModule("${resolved}");`;
+  });
+
+  // --- RE-EXPORTS MOVED HERE (Processed before standard exports) ---
+
+  // 9. Re-export All
+  code = code.replace(/export\s*\*\s*from\s*(["'`])([^"'`]+)\1;?/g, (match, quote, path) => {
+    const resolved = resolvePath(path);
+    dependencies.push(resolved);
+    return `Object.entries(await requireModule("${resolved}")).forEach(([k, v]) => { 
+      if (k !== 'default') __exports__[k] = v; 
+    });`;
+  });
+  
+  // 10. Re-export Namespace
+  code = code.replace(/export\s*\*\s*as\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s+from\s*(["'`])([^"'`]+)\2;?/g, (match, varName, quote, path) => {
+    const resolved = resolvePath(path);
+    dependencies.push(resolved);
+    return `__exports__.${varName} = await requireModule("${resolved}");`;
+  });
+
+  // 11. Re-export Named
+  code = code.replace(/export\s*\{([^}]+)\}\s*from\s*(["'`])([^"'`]+)\2;?/g, (match, exportsStr, quote, path) => {
+    const resolved = resolvePath(path);
+    dependencies.push(resolved);
+    const assignments = exportsStr.split(',').map(item => {
+      let parts = item.trim().split(/\s+as\s+/);
+      const importedKey = parts[0].trim();
+      const exportedKey = parts.length === 2 ? parts[1].trim() : importedKey;
+      return `__exports__.${exportedKey} = (await requireModule("${resolved}")).${importedKey};`;
+    }).join('\n');
+    return assignments;
+  });
+
+  // --- STANDARD EXPORTS ---
+
+  // 6. Named Exports (Added negative lookahead so it ignores "from")
+  code = code.replace(/export\s*\{([^}]+)\}(?!\s+from);?/g, (match, exportsStr) => {
+    return exportsStr.split(',').map(item => {
+      let parts = item.trim().split(/\s+as\s+/);
+      const key = parts.length === 2 ? parts[1].trim() : parts[0].trim();
+      const val = parts[0].trim();
+      return `__exports__.${key} = ${val};`;
+    }).join('\n');
+  });
+
+  // 7. Default Exports
+  code = code.replace(/export\s+default\s+([^;]+);?/g, (match, val) => {
+    return `__exports__.default = ${val.trim()};`;
+  });
+
+  // 8. Inline Exports
+  code = code.replace(/export\s+(async\s+)?(const|let|var|function|class)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/g, (match, asyncMod, type, varName) => {
+    inlineExports.push(varName);
+    return `${asyncMod || ''}${type} ${varName}`; 
+  });
+
+  if (inlineExports.length > 0) {
+    const assignments = inlineExports.map(varName => `__exports__.${varName} = ${varName};`).join('\n');
+    code += `\n\n// --- Inline Exports ---\n${assignments}`;
+  }
+
+  const finalCode = `window._registry["${name}"] = async function() {
+const __exports__ = {};\n
+try {
+${code}
+} catch(e) {
+  e.fileName = "${name}";
+  window.__logErrorObj(e);
+}
+\nreturn __exports__;
+};`;
+  
+  // logAnything(name, finalCode);
+
+  return {
+    code: finalCode,
+    dependencies: dependencies
+  };
 }
 
 function parseOBJ(text) {
